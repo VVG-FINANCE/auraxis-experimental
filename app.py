@@ -1,205 +1,231 @@
-# =========================
-# Auraxis 2.2 - Experimental Stable
-# =========================
-
 import streamlit as st
 import yfinance as yf
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Auraxis 2.2", layout="wide")
-st.title("Auraxis 2.2 — Simulator Fusion Layer")
+# ==========================
+# CONFIGURAÇÃO INICIAL
+# ==========================
 
-# -------------------------
-# Sidebar - Configurações
-# -------------------------
-st.sidebar.header("Configurações do Usuário")
-
-perfil_trader = st.sidebar.selectbox(
-    "Perfil de Trader:",
-    ["Ultra Conservador", "Conservador", "Moderado", "Agressivo", "Automático"]
+st.set_page_config(
+    page_title="Auraxis Radar Institucional",
+    layout="wide"
 )
 
-simulador_tipo = st.sidebar.selectbox(
-    "Simulador:",
-    ["Manual", "Assistido", "Automático"]
-)
-
-leverage_guide = {
-    "Ultra Conservador": "1:10",
-    "Conservador": "1:20",
-    "Moderado": "1:50",
-    "Agressivo": "1:100",
-    "Automático": "Adaptável"
-}
-
-st.sidebar.markdown(f"**Alavancagem orientativa:** {leverage_guide[perfil_trader]}")
-
-pares_disponiveis = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", "AUDUSD=X"]
-periodo = st.sidebar.selectbox("Timeframe:", ["1m", "5m"])
-
-# -------------------------
-# Funções
-# -------------------------
-def fetch_yahoo_data(symbol, period="7d", interval="1m"):
-    df = yf.download(symbol, period=period, interval=interval, progress=False)
-    if df.empty:
-        return pd.DataFrame()
-
-    df = df.reset_index()
-
-    if 'Datetime' not in df.columns:
-        if 'Date' in df.columns:
-            df.rename(columns={'Date': 'Datetime'}, inplace=True)
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-
-    required = ['Datetime', 'Open', 'High', 'Low', 'Close']
-    df = df[[c for c in required if c in df.columns]]
-
-    return df.dropna()
-
-
-def candle_valido(df):
-    return (
-        (df['High'] > 0) &
-        (df['Low'] > 0) &
-        (df['Open'] > 0) &
-        (df['Close'] > 0)
-    )
-
-
-def compute_confidence(df):
-    body = abs(df['Close'] - df['Open'])
-    total_range = df['High'] - df['Low']
-    total_range = total_range.replace(0, np.nan)
-    conf = body / total_range
-    conf = conf.fillna(0.3)
-    return np.minimum(0.85, conf * 0.85 + 0.15)
-
-
-def compute_regime(df):
-    diff = df['Close'] - df['Open']
-    return np.where(abs(diff) < 0.0005, "Lateral",
-           np.where(diff > 0, "Alta", "Baixa"))
-
-
-def compute_fragmentation(candle):
-    zones = {}
-    high = candle['High']
-    low = candle['Low']
-    open_ = candle['Open']
-    range_ = high - low
-
-    zones['zona_abertura'] = (open_, open_ + 0.2 * range_)
-    zones['zona_expansao'] = (open_ + 0.2 * range_, open_ + 0.5 * range_)
-    zones['zona_pullback'] = (open_ + 0.5 * range_, open_ + 0.7 * range_)
-    zones['zona_exp_final'] = (open_ + 0.7 * range_, open_ + 0.9 * range_)
-    zones['zona_exaustao'] = (open_ + 0.9 * range_, high)
-
-    return zones
-
-
-def simulate_SL_TP(candle, profile):
-    percent_map = {
-        "Ultra Conservador": 0.005,
-        "Conservador": 0.01,
-        "Moderado": 0.02,
-        "Agressivo": 0.03,
-        "Automático": 0.015
+st.markdown(
+    """
+    <style>
+    .big-font {font-size:22px !important; font-weight:600;}
+    .metric-box {
+        padding:15px;
+        border-radius:12px;
+        background-color:#111827;
+        text-align:center;
     }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
-    pct = percent_map.get(profile, 0.01)
-    range_ = candle['High'] - candle['Low']
-    sl = candle['Close'] - pct * range_
-    tp = candle['Close'] + pct * range_
+st.title("🌌 Auraxis — Radar Institucional")
 
-    return sl, tp
+# ==========================
+# SIDEBAR
+# ==========================
 
+st.sidebar.header("Configurações")
 
-def simulate_sweep_IPI(df):
-    delta = df['Close'].diff().fillna(0)
-    ipi = 0.5 + np.tanh(delta * 100) / 2
-    df['IPI'] = np.clip(ipi, 0, 1)
-    return df
+ativo = st.sidebar.selectbox(
+    "Ativo",
+    ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "XAUUSD=X"]
+)
 
+timeframe = st.sidebar.selectbox(
+    "Timeframe",
+    ["15m", "1h", "4h", "1d"]
+)
 
-# -------------------------
-# Interface Multi-Par
-# -------------------------
-tabs = st.tabs([p.replace("=X", "") for p in pares_disponiveis])
+simulacoes = st.sidebar.slider(
+    "Número de Simulações",
+    200, 3000, 1000, step=200
+)
 
-for i, par in enumerate(pares_disponiveis):
+horizonte = 20  # Escolha arquitetural fixa
 
-    with tabs[i]:
+# ==========================
+# DEFINIR PERÍODO ESTÁVEL
+# ==========================
 
-        st.subheader(f"Par: {par.replace('=X', '')}")
+def periodo_por_intervalo(tf):
+    if tf == "15m":
+        return "30d"
+    if tf == "1h":
+        return "60d"
+    if tf == "4h":
+        return "180d"
+    if tf == "1d":
+        return "1y"
 
-        df = fetch_yahoo_data(par, period="7d", interval=periodo)
+# ==========================
+# BAIXAR DADOS
+# ==========================
 
-        if df.empty:
-            st.warning("Sem dados disponíveis.")
-            continue
+df = yf.download(
+    ativo,
+    period=periodo_por_intervalo(timeframe),
+    interval=timeframe,
+    progress=False
+)
 
-        df = df[candle_valido(df)]
-        df['confidence'] = compute_confidence(df)
-        df['regime'] = compute_regime(df)
-        df = simulate_sweep_IPI(df)
+if df.empty:
+    st.error("Dados indisponíveis no momento.")
+    st.stop()
 
-        if df.empty:
-            st.warning("Sem candles válidos.")
-            continue
+df = df.dropna()
 
-        ultimo_candle = df.iloc[-1]
-        sl, tp = simulate_SL_TP(ultimo_candle, perfil_trader)
+# ==========================
+# RETORNOS LOG
+# ==========================
 
-        # -------------------------
-        # Gráfico
-        # -------------------------
-        fig = go.Figure()
+df["log_ret"] = np.log(df["Close"] / df["Close"].shift(1))
+df = df.dropna()
 
-        fig.add_trace(go.Candlestick(
-            x=df['Datetime'],
-            open=df['Open'],
-            high=df['High'],
-            low=df['Low'],
-            close=df['Close'],
-            name=f"{par} {periodo}"
-        ))
+retornos = df["log_ret"].values[-300:]  # janela estatística
 
-        fig.add_trace(go.Scatter(
-            x=df['Datetime'],
-            y=df['Close'] * df['IPI'],
-            mode='lines',
-            name='Sweep/IPI'
-        ))
+# ==========================
+# DETECÇÃO DE REGIME
+# ==========================
 
-        fig.add_hline(y=sl, line=dict(dash='dash'), annotation_text="SL")
-        fig.add_hline(y=tp, line=dict(dash='dash'), annotation_text="TP")
+media_ret = np.mean(retornos)
+vol = np.std(retornos)
 
-        fig.update_layout(
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False,
-            title=f"Auraxis 2.2 — {par.replace('=X', '')} ({periodo})"
-        )
+if abs(media_ret) > vol * 0.3:
+    regime = "Tendência"
+elif vol > np.percentile(np.abs(retornos), 75):
+    regime = "Expansão"
+else:
+    regime = "Lateral"
 
-        st.plotly_chart(fig, use_container_width=True)
+# ==========================
+# PROBABILIDADE CONDICIONAL
+# ==========================
 
-        # -------------------------
-        # Simulador
-        # -------------------------
-        if simulador_tipo != "Automático":
+historico = df.copy()
 
-            col1, col2 = st.columns(2)
+if regime == "Tendência":
+    filtro = abs(historico["log_ret"].rolling(10).mean()) > vol * 0.3
+elif regime == "Expansão":
+    filtro = historico["log_ret"].rolling(10).std() > vol
+else:
+    filtro = abs(historico["log_ret"].rolling(10).mean()) <= vol * 0.3
 
-            with col1:
-                if st.button(f"Aceitar {par}"):
-                    st.success(f"Entrada aceita | SL={sl:.5f} | TP={tp:.5f}")
+historico_regime = historico[filtro]
 
-            with col2:
-                if st.button(f"Descartar {par}"):
-                    st.warning("Entrada descartada")
+if len(historico_regime) > 30:
+    prob_alta = np.mean(historico_regime["log_ret"].shift(-1) > 0)
+else:
+    prob_alta = np.mean(historico["log_ret"].shift(-1) > 0)
 
-        st.dataframe(df.tail(50))
+# ==========================
+# MONTE CARLO (BOOTSTRAP)
+# ==========================
+
+ultimo_preco = df["Close"].iloc[-1]
+caminhos_finais = []
+projecoes = []
+
+for _ in range(simulacoes):
+    amostra = np.random.choice(retornos, size=horizonte, replace=True)
+    caminho = ultimo_preco * np.exp(np.cumsum(amostra))
+    projecoes.append(caminho)
+    caminhos_finais.append(caminho[-1])
+
+caminhos_finais = np.array(caminhos_finais)
+
+media_final = np.mean(caminhos_finais)
+p5 = np.percentile(caminhos_finais, 5)
+p95 = np.percentile(caminhos_finais, 95)
+
+retorno_esperado = (media_final / ultimo_preco - 1) * 100
+risco = (p5 / ultimo_preco - 1) * 100
+potencial = (p95 / ultimo_preco - 1) * 100
+
+# ==========================
+# PAINEL SUPERIOR
+# ==========================
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric("Regime", regime)
+col2.metric("Probabilidade Alta", f"{prob_alta*100:.2f}%")
+col3.metric("Retorno Esperado (20 candles)", f"{retorno_esperado:.2f}%")
+col4.metric("Assimetria (P95 vs P5)", f"{potencial - risco:.2f}%")
+
+# ==========================
+# GRÁFICO
+# ==========================
+
+fig = go.Figure()
+
+# Histórico
+fig.add_trace(
+    go.Candlestick(
+        x=df.index,
+        open=df["Open"],
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        name="Preço"
+    )
+)
+
+# Projeção média
+media_caminho = np.mean(projecoes, axis=0)
+future_index = pd.date_range(
+    start=df.index[-1],
+    periods=horizonte+1,
+    freq=df.index.inferred_freq
+)[1:]
+
+fig.add_trace(
+    go.Scatter(
+        x=future_index,
+        y=media_caminho,
+        mode="lines",
+        name="Projeção Média",
+        line=dict(width=3)
+    )
+)
+
+# Banda de risco
+fig.add_trace(
+    go.Scatter(
+        x=future_index,
+        y=[p5]*len(future_index),
+        mode="lines",
+        name="P5 (Risco)",
+        line=dict(dash="dash")
+    )
+)
+
+fig.add_trace(
+    go.Scatter(
+        x=future_index,
+        y=[p95]*len(future_index),
+        mode="lines",
+        name="P95 (Potencial)",
+        line=dict(dash="dash")
+    )
+)
+
+fig.update_layout(
+    template="plotly_dark",
+    height=750,
+    xaxis_rangeslider_visible=False
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+st.markdown("Radar baseado em Monte Carlo + Probabilidade Condicional Empírica.")
