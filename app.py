@@ -2,33 +2,14 @@ import streamlit as st
 import yfinance as yf
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+from streamlit_lightweight_charts import renderLightweightCharts
 
-# =====================================
-# CONFIGURAÇÃO INICIAL
-# =====================================
+st.set_page_config(page_title="Auraxis RIA", layout="wide")
+st.title("🌌 Auraxis — Radar Institucional Adaptativo")
 
-st.set_page_config(
-    page_title="Auraxis Radar Institucional",
-    layout="wide"
-)
-
-st.markdown("""
-<style>
-.metric-box {
-    padding:15px;
-    border-radius:12px;
-    background-color:#111827;
-    text-align:center;
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🌌 Auraxis — Radar Institucional")
-
-# =====================================
-# SIDEBAR
-# =====================================
+# ==========================
+# CONFIGURAÇÕES
+# ==========================
 
 st.sidebar.header("Configurações")
 
@@ -37,208 +18,189 @@ ativo = st.sidebar.selectbox(
     ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "XAUUSD=X"]
 )
 
-timeframe = st.sidebar.selectbox(
-    "Timeframe",
-    ["15m", "1h", "4h", "1d"]
-)
+simulacoes = st.sidebar.slider("Simulações Monte Carlo", 500, 3000, 1000, step=250)
 
-simulacoes = st.sidebar.slider(
-    "Número de Simulações",
-    200, 3000, 1000, step=200
-)
+horizonte = 20
 
-horizonte = 20  # decisão arquitetural fixa
+timeframes = {
+    "15m": ("30d", 1),
+    "1h": ("60d", 2),
+    "4h": ("180d", 3),
+    "1d": ("1y", 4),
+}
 
-# =====================================
-# PERÍODO ESTÁVEL
-# =====================================
+# ==========================
+# FUNÇÃO DE ANÁLISE
+# ==========================
 
-def periodo_por_intervalo(tf):
-    if tf == "15m":
-        return "30d"
-    if tf == "1h":
-        return "60d"
-    if tf == "4h":
-        return "180d"
-    if tf == "1d":
-        return "1y"
+def analisar_timeframe(tf, periodo, peso):
+    df = yf.download(ativo, period=periodo, interval=tf, progress=False)
 
-# =====================================
-# DOWNLOAD DADOS
-# =====================================
+    if df.empty:
+        return None
 
-df = yf.download(
-    ativo,
-    period=periodo_por_intervalo(timeframe),
-    interval=timeframe,
-    progress=False
-)
+    df = df.dropna()
+    df["log_ret"] = np.log(df["Close"] / df["Close"].shift(1))
+    df = df.dropna()
 
-if df.empty:
-    st.error("Dados indisponíveis no momento.")
+    retornos = df["log_ret"].values[-300:]
+    if len(retornos) < 50:
+        return None
+
+    media_ret = np.mean(retornos)
+    vol = np.std(retornos)
+
+    if abs(media_ret) > vol * 0.3:
+        regime = "Tendência"
+    elif vol > np.percentile(np.abs(retornos), 75):
+        regime = "Expansão"
+    else:
+        regime = "Lateral"
+
+    prob_alta = np.mean(df["log_ret"].shift(-1) > 0)
+
+    ultimo_preco = float(df["Close"].iloc[-1])
+
+    finais = []
+    for _ in range(simulacoes):
+        amostra = np.random.choice(retornos, size=horizonte, replace=True)
+        cumul = np.cumsum(amostra)
+        caminho = ultimo_preco * np.exp(cumul)
+        finais.append(caminho[-1])
+
+    finais = np.array(finais)
+
+    retorno_esperado = (np.mean(finais) / ultimo_preco - 1) * 100
+    p5 = (np.percentile(finais, 5) / ultimo_preco - 1) * 100
+    p95 = (np.percentile(finais, 95) / ultimo_preco - 1) * 100
+    assimetria = p95 - p5
+
+    direcao = 1 if retorno_esperado > 0 else -1
+
+    score = 0
+
+    score += min(abs(retorno_esperado) * 5, 30)
+    score += min(assimetria * 2, 30)
+    score += prob_alta * 40
+
+    score = min(score, 100)
+
+    return {
+        "timeframe": tf,
+        "peso": peso,
+        "score": score,
+        "direcao": direcao,
+        "prob": prob_alta,
+        "ret_esp": retorno_esperado,
+        "assimetria": assimetria,
+        "df": df
+    }
+
+# ==========================
+# EXECUÇÃO MULTI-TF
+# ==========================
+
+resultados = []
+
+for tf, (periodo, peso) in timeframes.items():
+    r = analisar_timeframe(tf, periodo, peso)
+    if r:
+        resultados.append(r)
+
+if not resultados:
+    st.error("Sem dados suficientes.")
     st.stop()
 
-df = df.dropna()
+# ==========================
+# SCORE GLOBAL PONDERADO
+# ==========================
 
-# =====================================
-# RETORNOS LOG
-# =====================================
+peso_total = sum(r["peso"] for r in resultados)
+score_global = sum(r["score"] * r["peso"] for r in resultados) / peso_total
 
-df["log_ret"] = np.log(df["Close"] / df["Close"].shift(1))
-df = df.dropna()
+direcao_global = np.sign(sum(r["direcao"] * r["peso"] for r in resultados))
 
-retornos = df["log_ret"].dropna().values[-300:].astype(float)
+# ==========================
+# CLASSIFICAÇÃO
+# ==========================
 
-if len(retornos) < 50:
-    st.error("Dados insuficientes para simulação.")
-    st.stop()
-
-# =====================================
-# DETECÇÃO DE REGIME
-# =====================================
-
-media_ret = float(np.mean(retornos))
-vol = float(np.std(retornos))
-
-if abs(media_ret) > vol * 0.3:
-    regime = "Tendência"
-elif vol > np.percentile(np.abs(retornos), 75):
-    regime = "Expansão"
+if score_global >= 85:
+    classificacao = "🔥 Oportunidade Forte"
+elif score_global >= 75:
+    classificacao = "🚀 Oportunidade"
+elif score_global >= 60:
+    classificacao = "⚠ Preparação"
 else:
-    regime = "Lateral"
+    classificacao = "Neutro"
 
-# =====================================
-# PROBABILIDADE CONDICIONAL EMPÍRICA
-# =====================================
+# ==========================
+# PAINEL
+# ==========================
 
-historico = df.copy()
+col1, col2, col3 = st.columns(3)
 
-rolling_mean = historico["log_ret"].rolling(10).mean()
-rolling_std = historico["log_ret"].rolling(10).std()
+col1.metric("Score Global", f"{score_global:.1f}")
+col2.metric("Classificação", classificacao)
+col3.metric("Direção Dominante", "Alta" if direcao_global > 0 else "Baixa")
 
-if regime == "Tendência":
-    filtro = abs(rolling_mean) > vol * 0.3
-elif regime == "Expansão":
-    filtro = rolling_std > vol
-else:
-    filtro = abs(rolling_mean) <= vol * 0.3
+st.markdown("### Scores por Timeframe")
 
-historico_regime = historico[filtro]
-
-if len(historico_regime) > 30:
-    prob_alta = float(np.mean(historico_regime["log_ret"].shift(-1) > 0))
-else:
-    prob_alta = float(np.mean(historico["log_ret"].shift(-1) > 0))
-
-# =====================================
-# MONTE CARLO BOOTSTRAP
-# =====================================
-
-ultimo_preco = float(df["Close"].iloc[-1])
-
-caminhos_finais = []
-projecoes = []
-
-for _ in range(simulacoes):
-    amostra = np.random.choice(retornos, size=horizonte, replace=True).astype(float)
-    cumul = np.cumsum(amostra)
-    caminho = ultimo_preco * np.exp(cumul)
-    projecoes.append(caminho)
-    caminhos_finais.append(caminho[-1])
-
-caminhos_finais = np.array(caminhos_finais)
-
-media_final = float(np.mean(caminhos_finais))
-p5 = float(np.percentile(caminhos_finais, 5))
-p95 = float(np.percentile(caminhos_finais, 95))
-
-retorno_esperado = (media_final / ultimo_preco - 1) * 100
-risco = (p5 / ultimo_preco - 1) * 100
-potencial = (p95 / ultimo_preco - 1) * 100
-assimetria = potencial - risco
-
-# =====================================
-# PAINEL SUPERIOR
-# =====================================
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Regime", regime)
-col2.metric("Probabilidade Alta", f"{prob_alta*100:.2f}%")
-col3.metric("Retorno Esperado (20 candles)", f"{retorno_esperado:.2f}%")
-col4.metric("Assimetria Estatística", f"{assimetria:.2f}%")
-
-# =====================================
-# GRÁFICO
-# =====================================
-
-fig = go.Figure()
-
-# Histórico
-fig.add_trace(
-    go.Candlestick(
-        x=df.index,
-        open=df["Open"],
-        high=df["High"],
-        low=df["Low"],
-        close=df["Close"],
-        name="Preço"
+for r in resultados:
+    st.write(
+        f"{r['timeframe']} | Score: {r['score']:.1f} | "
+        f"Prob: {r['prob']*100:.1f}% | "
+        f"Retorno Esp: {r['ret_esp']:.2f}% | "
+        f"Assimetria: {r['assimetria']:.2f}%"
     )
-)
 
-# Índice futuro seguro
-freq = df.index.inferred_freq
-if freq is None:
-    freq = "D"
+# ==========================
+# GRÁFICO (Timeframe Principal 1h)
+# ==========================
 
-future_index = pd.date_range(
-    start=df.index[-1],
-    periods=horizonte + 1,
-    freq=freq
-)[1:]
+principal = next((r for r in resultados if r["timeframe"] == "1h"), resultados[0])
+df_chart = principal["df"].reset_index()
 
-media_caminho = np.mean(projecoes, axis=0)
+candles = []
 
-# Projeção média
-fig.add_trace(
-    go.Scatter(
-        x=future_index,
-        y=media_caminho,
-        mode="lines",
-        name="Projeção Média",
-        line=dict(width=3)
-    )
-)
+for _, row in df_chart.iterrows():
+    time_value = row[df_chart.columns[0]]
+    candles.append({
+        "time": pd.to_datetime(time_value).strftime("%Y-%m-%dT%H:%M:%S"),
+        "open": float(row["Open"]),
+        "high": float(row["High"]),
+        "low": float(row["Low"]),
+        "close": float(row["Close"]),
+    })
 
-# Banda inferior
-fig.add_trace(
-    go.Scatter(
-        x=future_index,
-        y=[p5] * len(future_index),
-        mode="lines",
-        name="P5 (Risco)",
-        line=dict(dash="dash")
-    )
-)
+chart_config = [{
+    "chart": {
+        "layout": {
+            "background": {"type": "solid", "color": "#000000"},
+            "textColor": "#d1d4dc",
+        },
+        "grid": {
+            "vertLines": {"color": "#1c1c1c"},
+            "horzLines": {"color": "#1c1c1c"},
+        },
+        "height": 650,
+    },
+    "series": [
+        {
+            "type": "Candlestick",
+            "data": candles,
+            "options": {
+                "upColor": "#26a69a",
+                "downColor": "#ef5350",
+                "borderUpColor": "#26a69a",
+                "borderDownColor": "#ef5350",
+                "wickUpColor": "#26a69a",
+                "wickDownColor": "#ef5350",
+            }
+        }
+    ]
+}]
 
-# Banda superior
-fig.add_trace(
-    go.Scatter(
-        x=future_index,
-        y=[p95] * len(future_index),
-        mode="lines",
-        name="P95 (Potencial)",
-        line=dict(dash="dash")
-    )
-)
-
-fig.update_layout(
-    template="plotly_dark",
-    height=750,
-    xaxis_rangeslider_visible=False
-)
-
-st.plotly_chart(fig, use_container_width=True)
+renderLightweightCharts(chart_config)
 
 st.markdown("---")
-st.markdown("Radar baseado em Monte Carlo (Bootstrap) + Probabilidade Condicional Empírica.")
+st.markdown("Sistema baseado em Consenso Ponderado + Monte Carlo + Probabilidade Condicional.")
